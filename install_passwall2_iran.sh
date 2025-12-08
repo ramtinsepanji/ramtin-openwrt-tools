@@ -1,156 +1,192 @@
 #!/bin/sh
-# ramtinsepanji / ramtin-openwrt-tools
-# Universal Passwall2 + Iran Geo installer for OpenWrt
+# install_passwall2_iran.sh
+# Universal Passwall2 + Iran geosite installer for OpenWrt
 
 set -e
 
 echo "=== [Passwall2 Iran Installer] Starting ==="
 
-# --- Basic sanity checks ---
-if [ "$(id -u)" != "0" ]; then
-  echo "ERROR: This script must be run as root (uid=0)." >&2
-  exit 1
+# --- Detect OpenWrt release and arch ---
+if [ -f /etc/openwrt_release ]; then
+    . /etc/openwrt_release
+else
+    echo "ERROR: This script is intended for OpenWrt only."
+    exit 1
 fi
 
-if [ ! -f /etc/openwrt_release ]; then
-  echo "ERROR: This system does not look like OpenWrt." >&2
-  exit 1
-fi
+REL="${DISTRIB_RELEASE%.*}"
+[ -z "$REL" ] && REL="$DISTRIB_RELEASE"
+ARCH="$DISTRIB_ARCH"
+TARGET="$DISTRIB_TARGET"
 
-. /etc/openwrt_release
-
-release_short="${DISTRIB_RELEASE%.*}"
-[ -z "$release_short" ] && release_short="$DISTRIB_RELEASE"
-arch="$DISTRIB_ARCH"
-
-echo "Detected OpenWrt: $DISTRIB_ID $DISTRIB_RELEASE ($DISTRIB_DESCRIPTION)"
-echo "Target: ${DISTRIB_TARGET:-unknown}, Arch: $arch"
-echo "Using release tag: $release_short"
+echo "Detected OpenWrt: ${DISTRIB_DESCRIPTION}"
+echo "Target: ${TARGET}, Arch: ${ARCH}"
+echo "Using release tag: ${REL}"
 echo
 
-# --- Ensure customfeeds exists ---
-FEEDS="/etc/opkg/customfeeds.conf"
-if [ ! -f "$FEEDS" ]; then
-  touch "$FEEDS"
+# --- Ensure customfeeds.conf exists ---
+CUSTOMFEEDS="/etc/opkg/customfeeds.conf"
+if [ ! -f "$CUSTOMFEEDS" ]; then
+    echo "Creating $CUSTOMFEEDS ..."
+    touch "$CUSTOMFEEDS"
 fi
 
 # --- Add Passwall feeds if missing ---
 echo "=== Adding Passwall feeds if missing ==="
-if ! grep -q "passwall2" "$FEEDS"; then
-  cat >> "$FEEDS" << EOT
-src/gz passwall_packages https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-$release_short/$arch/passwall_packages
-src/gz passwall2 https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-$release_short/$arch/passwall2
-EOT
-  echo "Passwall feeds added to $FEEDS"
+PASSWALL_PKG_LINE="src/gz passwall_packages https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-${REL}/${ARCH}/passwall_packages"
+PASSWALL2_LINE="src/gz passwall2 https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-${REL}/${ARCH}/passwall2"
+
+if ! grep -q "passwall_packages" "$CUSTOMFEEDS" 2>/dev/null; then
+    echo "$PASSWALL_PKG_LINE" >> "$CUSTOMFEEDS"
+    echo "Added passwall_packages feed."
 else
-  echo "Passwall feeds already present in $FEEDS"
+    echo "passwall_packages feed already present."
+fi
+
+if ! grep -q "passwall2" "$CUSTOMFEEDS" 2>/dev/null; then
+    echo "$PASSWALL2_LINE" >> "$CUSTOMFEEDS"
+    echo "Added passwall2 feed."
+else
+    echo "passwall2 feed already present."
 fi
 
 echo
+
+# --- Ensure Passwall GPG key is installed ---
+echo "=== Ensuring Passwall GPG key is installed ==="
+KEY_URL="https://master.dl.sourceforge.net/project/openwrt-passwall-build/passwall.pub"
+wget -q -O /tmp/passwall.pub "$KEY_URL" || echo "WARNING: Failed to download passwall.pub (will still try opkg)."
+if [ -s /tmp/passwall.pub ]; then
+    opkg-key add /tmp/passwall.pub 2>/dev/null || true
+    echo "Passwall GPG key added (or already present)."
+else
+    echo "WARNING: passwall.pub is empty/missing, signature errors may appear."
+fi
+
+echo
+
+# --- opkg update (do not fail on partial errors) ---
 echo "=== Running opkg update (errors from some feeds are possible) ==="
 set +e
 opkg update
-OPKG_RC=$?
 set -e
-if [ "$OPKG_RC" -ne 0 ]; then
-  echo "WARNING: opkg update reported errors. Continuing, but some packages may be missing." >&2
-fi
+echo
 
-# --- Helper to install packages with a nicer log ---
-install_pkg() {
-  for p in "$@"; do
-    echo
-    echo "=== Installing package: $p ==="
-    if ! opkg install "$p"; then
-      echo "WARNING: Failed to install package: $p" >&2
+# --- Ensure dnsmasq-full is installed ---
+echo "=== Ensuring dnsmasq-full is installed ==="
+if opkg list-installed dnsmasq-full >/dev/null 2>&1; then
+    echo "dnsmasq-full already installed."
+else
+    if opkg list-installed dnsmasq >/dev/null 2>&1; then
+        echo "Removing dnsmasq ..."
+        opkg remove dnsmasq || true
     fi
-  done
-}
-
-# --- Replace dnsmasq with dnsmasq-full ---
-echo
-echo "=== Replacing dnsmasq with dnsmasq-full ==="
-if opkg list-installed | grep -q '^dnsmasq '; then
-  opkg remove dnsmasq --force-depends || true
+    echo "Installing dnsmasq-full ..."
+    opkg install dnsmasq-full
 fi
-install_pkg dnsmasq-full
-
-# --- Core packages for Passwall2 ---
 echo
+
+# --- Base dependencies ---
 echo "=== Installing core packages (Passwall2, Xray, Geo, tools) ==="
-
-# Optional tools first
-install_pkg wget-ssl curl tcping geoview
-
-# Kernel NF-T Proxy modules (may fail on some targets; not fatal)
-install_pkg kmod-nft-tproxy kmod-nft-socket
-
-# Passwall2 + Xray + Iran GeoSite
+BASE_PKGS="wget-ssl curl kmod-nft-tproxy kmod-nft-socket"
+for p in $BASE_PKGS; do
+    echo ">> Ensuring package: $p"
+    if ! opkg list-installed "$p" >/dev/null 2>&1; then
+        opkg install "$p" || echo "WARNING: Failed to install $p (optional or kernel-dependent)."
+    else
+        echo "   $p already installed."
+    fi
+done
 echo
-echo "=== Installing luci-app-passwall2, xray-core, v2ray-geosite-ir ==="
-if ! opkg install luci-app-passwall2; then
-  echo "ERROR: luci-app-passwall2 is not available for this arch/release." >&2
-  echo "       Arch: $arch, Release: $DISTRIB_RELEASE" >&2
-  exit 1
-fi
 
-install_pkg xray-core v2ray-geosite-ir
-
-# --- Ensure iran.dat exists in /usr/share/v2ray ---
+# --- Optional helper packages ---
+OPTIONAL_PKGS="tcping geoview"
+for p in $OPTIONAL_PKGS; do
+    echo ">> Ensuring optional package: $p"
+    if ! opkg list-installed "$p" >/dev/null 2>&1; then
+        opkg install "$p" || echo "WARNING: Optional package $p could not be installed."
+    else
+        echo "   $p already installed."
+    fi
+done
 echo
+
+# --- Install Passwall2 & geo databases ---
+CORE_PKGS="luci-app-passwall2 xray-core v2ray-geoip v2ray-geosite v2ray-geosite-ir"
+for p in $CORE_PKGS; do
+    echo ">> Ensuring core package: $p"
+    if ! opkg list-installed "$p" >/dev/null 2>&1; then
+        if ! opkg install "$p"; then
+            echo "ERROR: Failed to install $p. Check architecture/release compatibility."
+            exit 1
+        fi
+    else
+        echo "   $p already installed."
+    fi
+done
+echo
+
+# --- Ensure iran.dat is present ---
 echo "=== Ensuring /usr/share/v2ray/iran.dat exists ==="
-mkdir -p /usr/share/v2ray
-
-if [ -f /usr/share/v2ray/iran.dat ]; then
-  echo "iran.dat already exists in /usr/share/v2ray"
+IRAN_DAT="/usr/share/v2ray/iran.dat"
+if [ -f "$IRAN_DAT" ]; then
+    echo "iran.dat already present at $IRAN_DAT"
 else
-  echo "iran.dat not found, downloading from GitHub (bootmortis/iran-hosted-domains)..."
-  if ! wget -O /usr/share/v2ray/iran.dat \
-    https://github.com/bootmortis/iran-hosted-domains/releases/latest/download/iran.dat; then
-    echo "ERROR: Failed to download iran.dat" >&2
-    exit 1
-  fi
+    echo "WARNING: iran.dat not found at $IRAN_DAT."
+    echo "         Make sure v2ray-geosite-ir package is properly installed."
 fi
-
-# --- Make sure Passwall2 config/template exists ---
 echo
-echo "=== Ensuring Passwall2 configuration exists ==="
-/etc/init.d/passwall2 restart >/dev/null 2>&1 || true
 
-# --- Patch default template ---
-if [ -f /usr/share/passwall2/0_default_config ]; then
-  echo "Patching /usr/share/passwall2/0_default_config for Iran rules..."
-  sed -i "s/China/Iran/g" /usr/share/passwall2/0_default_config
-  sed -i "s/geoip:cn/geoip:ir/g" /usr/share/passwall2/0_default_config
-  sed -i "s/geosite:cn/geosite:category-ir\next:iran.dat:all/g" /usr/share/passwall2/0_default_config
+# --- Patch default Passwall2 config template if present ---
+DEFAULT_CFG="/usr/share/passwall2/0_default_config"
+if [ -f "$DEFAULT_CFG" ]; then
+    echo "=== Patching $DEFAULT_CFG for Iran rules ==="
+    sed -i 's/China/Iran/g' "$DEFAULT_CFG"
+    sed -i 's/geoip:cn/geoip:ir/g' "$DEFAULT_CFG"
+    # Replace China geosite with Iran geosite + iran.dat extension
+    sed -i 's/geosite:cn/geosite:category-ir\
+ext:iran.dat:all/g' "$DEFAULT_CFG"
 else
-  echo "WARNING: /usr/share/passwall2/0_default_config not found. Skipping template patch." >&2
+    echo "NOTE: $DEFAULT_CFG not found, skipping template patch."
 fi
-
-# --- Patch live /etc/config/passwall2 if present ---
-if [ -f /etc/config/passwall2 ]; then
-  echo
-  echo "=== Patching /etc/config/passwall2 for Iran rules and DNS ==="
-  sed -i "s/China/Iran/g" /etc/config/passwall2
-  sed -i "s/geoip:cn/geoip:ir/g" /etc/config/passwall2
-  sed -i "s/geosite:cn/geosite:category-ir\next:iran.dat:all/g" /etc/config/passwall2
-
-  uci set passwall2.@global[0].china='Iran' 2>/dev/null || true
-  uci set passwall2.@global[0].remote_dns_protocol='tcp' 2>/dev/null || true
-  uci set passwall2.@global[0].remote_dns='8.8.8.8' 2>/dev/null || true
-  uci set passwall2.@global[0].remote_dns_query_strategy='UseIPv4' 2>/dev/null || true
-  uci set passwall2.@global_rules[0].v2ray_location_asset='/usr/share/v2ray/' 2>/dev/null || true
-
-  uci commit passwall2 || true
-else
-  echo "WARNING: /etc/config/passwall2 not found (Passwall2 may not have started yet)." >&2
-fi
-
 echo
+
+# --- Ensure /etc/config/passwall2 exists ---
+RUNTIME_CFG="/etc/config/passwall2"
+if [ ! -f "$RUNTIME_CFG" ]; then
+    echo "NOTE: $RUNTIME_CFG does not exist yet. It will be created by Passwall2 on first start."
+    touch "$RUNTIME_CFG"
+fi
+
+echo "=== Patching /etc/config/passwall2 for Iran rules and DNS ==="
+
+# Set global China label to Iran, and v2ray assets path
+uci set passwall2.@global[0].china='Iran' 2>/dev/null || true
+uci set passwall2.@global_rules[0].v2ray_location_asset='/usr/share/v2ray/' 2>/dev/null || true
+
+# Ensure Iran shunt_rules section exists
+if uci -q get passwall2.Iran >/dev/null 2>&1; then
+    echo "Iran shunt_rules section already exists, updating values ..."
+else
+    echo "Creating Iran shunt_rules section ..."
+    SEC="$(uci add passwall2 shunt_rules)"
+    uci rename passwall2."$SEC"='Iran'
+fi
+
+# Standardized Iran rule (safe and consistent)
+uci set passwall2.Iran.remarks='Iran'
+uci set passwall2.Iran.network='tcp,udp'
+uci set passwall2.Iran.ip_list='geoip:ir,ext:iran.dat:all'
+uci set passwall2.Iran.domain_list='geosite:category-ir,ext:iran.dat:all'
+
+uci commit passwall2 || true
+echo
+
+# --- Restart services ---
 echo "=== Restarting dnsmasq and Passwall2 ==="
-/etc/init.d/dnsmasq restart || true
-/etc/init.d/passwall2 restart || true
-
+/etc/init.d/dnsmasq restart 2>/dev/null || echo "WARNING: dnsmasq restart failed (check service)."
+/etc/init.d/passwall2 restart 2>/dev/null || echo "NOTE: passwall2 service restart may fail if not fully configured yet."
 echo
+
 echo "=== [Passwall2 Iran Installer] DONE ==="
 echo "Open LuCI → Services → Passwall2 to configure your nodes and shunt."

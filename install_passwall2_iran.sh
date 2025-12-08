@@ -1,5 +1,5 @@
 #!/bin/sh
-# ramtin-openwrt-tools - Passwall2 + Iran geosite installer (v3)
+# ramtin-openwrt-tools - Passwall2 + Iran geosite installer (v4)
 # Safe on fresh factory reset & re-runs (idempotent, no duplicates).
 
 set -e
@@ -52,7 +52,7 @@ echo
 
 # --- Ensure Passwall GPG key is installed ----------------------------------------
 echo "=== Ensuring Passwall GPG key is installed ==="
-if ! opkg-key list | grep -q "openwrt-passwall-build" 2>/dev/null; then
+if ! opkg-key list 2>/dev/null | grep -q "openwrt-passwall-build"; then
     TMP_KEY="/tmp/passwall.pub"
     wget -q -O "$TMP_KEY" \
         "https://downloads.sourceforge.net/project/openwrt-passwall-build/passwall.pub" \
@@ -72,27 +72,30 @@ echo "=== Running opkg update (errors from some feeds are possible) ==="
 opkg update || true
 echo
 
-# --- Helper: ensure package is installed -----------------------------------------
+# --- Helper: ensure package is installed (robust check) --------------------------
 ensure_pkg() {
     PKG="$1"
     LABEL="$2"
     [ -z "$LABEL" ] && LABEL="$PKG"
 
     echo ">> Ensuring package: $LABEL"
-    if opkg list-installed "$PKG" >/dev/null 2>&1; then
-        echo "   $PKG already installed."
+
+    # Robust: واقعی از خروجی list-installed چک می‌کنیم
+    if opkg list-installed 2>/dev/null | grep -q "^${PKG} - "; then
+        echo "   ${PKG} already installed."
     else
+        echo "   Installing ${PKG} ..."
         opkg install "$PKG"
     fi
 }
 
 # --- Ensure dnsmasq-full ---------------------------------------------------------
 echo "=== Ensuring dnsmasq-full is installed ==="
-if ! opkg list-installed dnsmasq-full >/dev/null 2>&1; then
+if opkg list-installed 2>/dev/null | grep -q "^dnsmasq-full - "; then
+    echo "dnsmasq-full already installed."
+else
     opkg remove dnsmasq 2>/dev/null || true
     opkg install dnsmasq-full
-else
-    echo "dnsmasq-full already installed."
 fi
 
 echo
@@ -121,11 +124,11 @@ echo
 # --- Iran geosite: iran.dat is OPTIONAL ------------------------------------------
 echo "=== Checking for Iran geosite data (iran.dat) ==="
 IR_EXTRA=""
+
 if [ -f /usr/share/v2ray/iran.dat ]; then
     echo "Found /usr/share/v2ray/iran.dat"
     IR_EXTRA=",ext:iran.dat:all"
 else
-    # Try to locate any iran.dat-like file and symlink to standard path (best effort)
     CANDIDATE="$(find /usr/share -maxdepth 4 -type f -name 'iran.dat' 2>/dev/null | head -n 1)"
     if [ -n "$CANDIDATE" ]; then
         echo "Found iran.dat at: $CANDIDATE (creating symlink /usr/share/v2ray/iran.dat)"
@@ -143,7 +146,6 @@ echo
 # --- Patch Passwall2 config: Iran rules & china label ----------------------------
 echo "=== Patching /etc/config/passwall2 for Iran rules and DNS ==="
 
-# Make sure config file exists so uci has something to work with
 [ -f /etc/config/passwall2 ] || touch /etc/config/passwall2
 
 # Global section: set china label to 'Iran' (for UI)

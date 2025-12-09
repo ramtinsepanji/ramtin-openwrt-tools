@@ -1,183 +1,188 @@
 #!/bin/sh
-# ramtin-openwrt-tools - Passwall2 + Iran geosite installer (v4)
-# Safe on fresh factory reset & re-runs (idempotent, no duplicates).
+# ramtin-openwrt-tools / install_passwall2_iran.sh
+# نصب خودکار Passwall2 + Xray + Geo و تنظیم شانت Iran با geosite/geoip ایران
 
 set -e
 
-echo "=== [Passwall2 Iran Installer] Starting ==="
+log() {
+    echo "$@"
+}
 
-# --- Detect OpenWrt release / arch ------------------------------------------------
-DISTRIB_RELEASE=""
-DISTRIB_TARGET=""
-DISTRIB_ARCH=""
+HEADER() {
+    echo
+    echo "=== $@ ==="
+}
 
-if [ -f /etc/openwrt_release ]; then
-    . /etc/openwrt_release
-fi
+log "=== [Passwall2 Iran Installer] Starting ==="
 
-# RELEASE_TAG: e.g. 24.10 from 24.10.4
-REL_MAJOR="${DISTRIB_RELEASE%%.*}"
-REL_REST="${DISTRIB_RELEASE#*.}"
-REL_MINOR="${REL_REST%%.*}"
-RELEASE_TAG="${REL_MAJOR}.${REL_MINOR}"
+# --- 1) شناسایی سیستم --------------------------------------------------------
+OWRT_RELEASE=""
+OWRT_TARGET=""
+OWRT_ARCH="$(uname -m)"
 
-[ -z "$RELEASE_TAG" ] && RELEASE_TAG="24.10"
-[ -z "$DISTRIB_ARCH" ] && DISTRIB_ARCH="$(uname -m)"
+[ -f /etc/openwrt_release ] && . /etc/openwrt_release
 
-echo "Detected OpenWrt: ${DISTRIB_ID:-OpenWrt} ${DISTRIB_RELEASE:-unknown}"
-echo "Target: ${DISTRIB_TARGET:-unknown}, Arch: ${DISTRIB_ARCH}"
-echo "Using release tag: ${RELEASE_TAG}"
-echo
+[ -n "$DISTRIB_RELEASE" ] && OWRT_RELEASE="$DISTRIB_RELEASE"
+[ -n "$DISTRIB_TARGET" ]  && OWRT_TARGET="$DISTRIB_TARGET"
 
-PASSWALL_BASE="https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases"
-PASSWALL_PKG_URL="${PASSWALL_BASE}/packages-${RELEASE_TAG}/${DISTRIB_ARCH}/passwall_packages"
-PASSWALL2_PKG_URL="${PASSWALL_BASE}/packages-${RELEASE_TAG}/${DISTRIB_ARCH}/passwall2"
+log "Detected OpenWrt: ${OWRT_RELEASE:-unknown}"
+log "Target: ${OWRT_TARGET:-unknown}, Arch: ${OWRT_ARCH:-unknown}"
 
-CUSTOMFEEDS="/etc/opkg/customfeeds.conf"
+# برای الان، Passwall فقط تگ 24.10 دارد
+REL_TAG="24.10"
+log "Using release tag: $REL_TAG"
 
-# --- Add Passwall feeds if missing -----------------------------------------------
-echo "=== Adding Passwall feeds if missing ==="
+# --- 2) اضافه کردن فیدهای Passwall -----------------------------------------
+CUSTOM_FEEDS="/etc/opkg/customfeeds.conf"
 
-grep -q "passwall_packages" "$CUSTOMFEEDS" 2>/dev/null || {
-    echo "src/gz passwall_packages ${PASSWALL_PKG_URL}" >> "$CUSTOMFEEDS"
+HEADER "Adding Passwall feeds if missing"
+
+grep -q "passwall_packages" "$CUSTOM_FEEDS" 2>/dev/null || {
     echo "Added passwall_packages feed."
+    echo "src/gz passwall_packages https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-${REL_TAG}/aarch64_cortex-a53/passwall_packages" >> "$CUSTOM_FEEDS"
 }
 
-grep -q "passwall2 " "$CUSTOMFEEDS" 2>/dev/null || {
-    echo "src/gz passwall2 ${PASSWALL2_PKG_URL}" >> "$CUSTOMFEEDS"
+grep -q "passwall2" "$CUSTOM_FEEDS" 2>/dev/null || {
     echo "Added passwall2 feed."
+    echo "src/gz passwall2 https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-${REL_TAG}/aarch64_cortex-a53/passwall2" >> "$CUSTOM_FEEDS"
 }
 
-echo
+# --- 3) اضافه کردن GPG key برای فید Passwall --------------------------------
+HEADER "Ensuring Passwall GPG key is installed"
 
-# --- Ensure Passwall GPG key is installed ----------------------------------------
-echo "=== Ensuring Passwall GPG key is installed ==="
-if ! opkg-key list 2>/dev/null | grep -q "openwrt-passwall-build"; then
-    TMP_KEY="/tmp/passwall.pub"
-    wget -q -O "$TMP_KEY" \
-        "https://downloads.sourceforge.net/project/openwrt-passwall-build/passwall.pub" \
-        || wget -q -O "$TMP_KEY" \
-        "https://master.dl.sourceforge.net/project/openwrt-passwall-build/passwall.pub" \
-        || echo "WARNING: Could not download Passwall public key."
-    [ -f "$TMP_KEY" ] && opkg-key add "$TMP_KEY" 2>/dev/null || true
+PASSWALL_PUB_TMP="/tmp/passwall.pub"
+# اگر opkg-key هست، سعی می‌کنیم key رو اضافه کنیم
+if command -v opkg-key >/dev/null 2>&1; then
+    wget -q -O "$PASSWALL_PUB_TMP" \
+        "https://downloads.sourceforge.net/project/openwrt-passwall-build/passwall.pub" && \
+        opkg-key add "$PASSWALL_PUB_TMP" >/dev/null 2>&1 || true
     echo "Passwall GPG key added (or already present)."
 else
-    echo "Passwall GPG key already present."
+    echo "WARNING: opkg-key not found; skipping adding Passwall GPG key."
 fi
 
-echo
+# --- 4) opkg update ----------------------------------------------------------
+HEADER "Running opkg update (errors from some feeds are possible)"
+opkg update
 
-# --- opkg update ------------------------------------------------------------------
-echo "=== Running opkg update (errors from some feeds are possible) ==="
-opkg update || true
-echo
+# --- 5) جایگزینی dnsmasq با dnsmasq-full ------------------------------------
+HEADER "Ensuring dnsmasq-full is installed"
 
-# --- Helper: ensure package is installed (robust check) --------------------------
+if ! opkg list-installed | grep -q "^dnsmasq-full "; then
+    # اگر dnsmasq ساده نصب است، ابتدا پاکش می‌کنیم
+    if opkg list-installed | grep -q "^dnsmasq "; then
+        echo "Removing dnsmasq ..."
+        opkg remove dnsmasq || true
+    fi
+
+    echo "Installing dnsmasq-full ..."
+    opkg install dnsmasq-full
+else
+    echo "dnsmasq-full already installed."
+fi
+
+# --- 6) تابع نصب پکیج‌ها -----------------------------------------------------
 ensure_pkg() {
-    PKG="$1"
-    LABEL="$2"
-    [ -z "$LABEL" ] && LABEL="$PKG"
-
-    echo ">> Ensuring package: $LABEL"
-
-    # Robust: واقعی از خروجی list-installed چک می‌کنیم
-    if opkg list-installed 2>/dev/null | grep -q "^${PKG} - "; then
-        echo "   ${PKG} already installed."
+    local pkg="$1"
+    echo ">> Ensuring package: $pkg"
+    if opkg list-installed | grep -q "^${pkg} "; then
+        echo "   $pkg already installed."
     else
-        echo "   Installing ${PKG} ..."
-        opkg install "$PKG"
+        echo "   Installing $pkg ..."
+        opkg install "$pkg"
     fi
 }
 
-# --- Ensure dnsmasq-full ---------------------------------------------------------
-echo "=== Ensuring dnsmasq-full is installed ==="
-if opkg list-installed 2>/dev/null | grep -q "^dnsmasq-full - "; then
-    echo "dnsmasq-full already installed."
-else
-    opkg remove dnsmasq 2>/dev/null || true
-    opkg install dnsmasq-full
-fi
-
-echo
-
-# --- Core packages (no Iran logic yet) -------------------------------------------
-echo "=== Installing core packages (Passwall2, Xray, Geo, tools) ==="
-
-ensure_pkg wget-ssl "wget-ssl"
-ensure_pkg curl "curl"
-ensure_pkg kmod-nft-tproxy "kmod-nft-tproxy"
-ensure_pkg kmod-nft-socket "kmod-nft-socket"
-
-# Optional but useful helper tools
-ensure_pkg tcping "tcping (optional)"
-ensure_pkg geoview "geoview (optional)"
-
-# Passwall2 stack
-ensure_pkg luci-app-passwall2 "luci-app-passwall2"
-ensure_pkg xray-core "xray-core"
-ensure_pkg v2ray-geoip "v2ray-geoip"
-ensure_pkg v2ray-geosite "v2ray-geosite (global geosite)"
-ensure_pkg v2ray-geosite-ir "v2ray-geosite-ir (Iran geosite)"
-
-echo
-
-# --- Iran geosite: iran.dat is OPTIONAL ------------------------------------------
-echo "=== Checking for Iran geosite data (iran.dat) ==="
-IR_EXTRA=""
-
-if [ -f /usr/share/v2ray/iran.dat ]; then
-    echo "Found /usr/share/v2ray/iran.dat"
-    IR_EXTRA=",ext:iran.dat:all"
-else
-    CANDIDATE="$(find /usr/share -maxdepth 4 -type f -name 'iran.dat' 2>/dev/null | head -n 1)"
-    if [ -n "$CANDIDATE" ]; then
-        echo "Found iran.dat at: $CANDIDATE (creating symlink /usr/share/v2ray/iran.dat)"
-        mkdir -p /usr/share/v2ray
-        ln -sf "$CANDIDATE" /usr/share/v2ray/iran.dat
-        IR_EXTRA=",ext:iran.dat:all"
+ensure_optional_pkg() {
+    local pkg="$1"
+    echo ">> Ensuring package: $pkg (optional)"
+    if opkg list-installed | grep -q "^${pkg} "; then
+        echo "   $pkg already installed."
     else
-        echo "NOTE: iran.dat not found. Script will use only builtin geosite:category-ir."
-        echo "      This is safe; extra iran.dat data is just an improvement if present."
+        echo "   Installing $pkg ..."
+        if ! opkg install "$pkg"; then
+            echo "   WARNING: optional package $pkg failed to install, skipping."
+        fi
     fi
-fi
+}
 
-echo
+# --- 7) نصب پکیج‌های اصلی و ضروری -------------------------------------------
+HEADER "Installing core packages (Passwall2, Xray, Geo, tools)"
 
-# --- Patch Passwall2 config: Iran rules & china label ----------------------------
-echo "=== Patching /etc/config/passwall2 for Iran rules and DNS ==="
+# ابزارهای پایه
+ensure_pkg wget-ssl
+ensure_pkg curl
 
-[ -f /etc/config/passwall2 ] || touch /etc/config/passwall2
+# nftables tproxy/socket
+ensure_pkg kmod-nft-tproxy
+ensure_pkg kmod-nft-socket
 
-# Global section: set china label to 'Iran' (for UI)
-if uci -q show passwall2.@global[0] >/dev/null 2>&1; then
-    uci set passwall2.@global[0].china='Iran'
+# ابزارهای کمکی (اختیاری)
+ensure_optional_pkg tcping
+ensure_optional_pkg geoview
+
+# خود Passwall2 و Xray و Geo
+ensure_pkg luci-app-passwall2
+ensure_pkg xray-core
+ensure_pkg v2ray-geoip
+ensure_pkg v2ray-geosite
+ensure_pkg v2ray-geosite-ir
+
+# --- 8) بررسی وجود iran.dat --------------------------------------------------
+HEADER "Checking for Iran geosite data (iran.dat)"
+
+IRAN_DAT="/usr/share/v2ray/iran.dat"
+if [ -f "$IRAN_DAT" ]; then
+    echo "Found $IRAN_DAT"
+    HAS_IRAN_DAT=1
 else
-    SEC="$(uci add passwall2 global)"
-    uci set passwall2."$SEC".enabled='0'
-    uci set passwall2."$SEC".china='Iran'
+    echo "NOTE: iran.dat not found. Script will use only builtin geosite:category-ir."
+    HAS_IRAN_DAT=0
 fi
 
-# Iran shunt_rules section (idempotent)
-if ! uci -q show passwall2.Iran >/dev/null 2>&1; then
-    uci set passwall2.Iran=shunt_rules
-fi
+# --- 9) تنظیم شانت Iran در Passwall2 -----------------------------------------
+patch_passwall2_config() {
+    HEADER "Patching /etc/config/passwall2 for Iran rules and DNS"
 
-uci set passwall2.Iran.remarks='Iran'
-uci set passwall2.Iran.network='tcp,udp'
-uci set passwall2.Iran.ip_list="geoip:ir${IR_EXTRA}"
-uci set passwall2.Iran.domain_list="geosite:category-ir${IR_EXTRA}"
+    # حداقل سکشن شانت Iran
+    uci -q batch << 'EOF'
+set passwall2.Iran=shunt_rules
+set passwall2.Iran.remarks='Iran'
+set passwall2.Iran.network='tcp,udp'
+EOF
 
-uci commit passwall2
+    # IP list: ایران + private
+    uci set passwall2.Iran.ip_list='geoip:ir
+geoip:private'
 
-echo "Passwall2 config patched:"
-uci show passwall2.Iran 2>/dev/null || true
-echo
+    # Domain list: geosite ایران + iran.dat اگر وجود داشته باشد
+    if [ "$HAS_IRAN_DAT" -eq 1 ]; then
+        uci set passwall2.Iran.domain_list='geosite:category-ir
+ext:iran.dat:ir
+ext:iran.dat:other'
+    else
+        # فقط دسته ایرانی از geosite اصلی
+        uci set passwall2.Iran.domain_list='geosite:category-ir'
+    fi
 
-# --- Restart services ------------------------------------------------------------
-echo "=== Restarting dnsmasq and Passwall2 ==="
-/etc/init.d/dnsmasq restart 2>/dev/null || true
+    uci commit passwall2
+
+    echo
+    echo "Passwall2 Iran shunt configured as:"
+    uci show passwall2.Iran || true
+}
+
+patch_passwall2_config
+
+# --- 10) ریستارت dnsmasq و Passwall2 ----------------------------------------
+HEADER "Restarting dnsmasq and Passwall2"
+
+#/etc/init.d/network reload 2>/dev/null || true
+/etc/init.d/dnsmasq restart 2>/dev/null || /etc/init.d/dnsmasq start 2>/dev/null || true
 /etc/init.d/passwall2 restart 2>/dev/null || true
 
-echo
-echo "=== [Passwall2 Iran Installer] DONE ==="
-echo "Open LuCI → Services → Passwall2 to add your nodes and assign 'Iran' shunt."
+log ""
+log "=== [Passwall2 Iran Installer] DONE ==="
+log "Open LuCI → Services → Passwall2:"
+log "  • Nodes را تنظیم کن"
+log "  • در Shunt Rules از سکشن 'Iran' برای ترافیک ایران استفاده کن."

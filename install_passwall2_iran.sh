@@ -1,195 +1,167 @@
-cat << 'EOF' > /tmp/install_passwall2_iran.sh
 #!/bin/sh
 set -eu
 
-SCRIPT_NAME="install_passwall2_iran"
-PASSWALL_BASE="https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases"
-PW_KEY_URL="https://master.dl.sourceforge.net/project/openwrt-passwall-build/passwall.pub"
+echo "=== [install_passwall2_iran] Starting ==="
 
-log() { printf '%s\n' "$*"; }
-die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+say() { echo "$*"; }
 
-need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
-
-detect_release_tag() {
-  if [ -r /etc/openwrt_release ]; then
-    # shellcheck disable=SC1091
-    . /etc/openwrt_release
-    if [ -n "${DISTRIB_RELEASE:-}" ]; then
-      echo "${DISTRIB_RELEASE%.*}"
-      return 0
-    fi
+# --- Detect OpenWrt release tag (e.g. 24.10) ---
+REL_TAG="24.10"
+if [ -r /etc/openwrt_release ]; then
+  . /etc/openwrt_release 2>/dev/null || true
+  # DISTRIB_RELEASE like 24.10.4 -> tag 24.10
+  if [ -n "${DISTRIB_RELEASE:-}" ]; then
+    REL_TAG="$(echo "$DISTRIB_RELEASE" | awk -F. '{print $1"."$2}')"
   fi
-  die "Cannot detect OpenWrt release tag from /etc/openwrt_release"
-}
+fi
 
-detect_best_arch() {
-  need_cmd opkg
-  # Prefer highest-priority non-all/non-noarch arch
-  # opkg print-architecture lines: "arch <name> <priority>"
-  opkg print-architecture 2>/dev/null | awk '
-    $1=="arch" {
-      name=$2; pr=$3;
-      if (name!="all" && name!="noarch") {
-        if (pr>best_pr) { best_pr=pr; best_name=name; }
-      }
-    }
-    END {
-      if (best_name=="") exit 1;
-      print best_name;
-    }' || die "Cannot detect opkg architecture (opkg print-architecture failed)"
-}
+# --- Detect best opkg arch for passwall feeds ---
+OPKG_ARCH="unknown"
+if need_cmd opkg; then
+  # First non-"all" arch
+  OPKG_ARCH="$(opkg print-architecture 2>/dev/null | awk '$1!="all"{print $1; exit}')"
+fi
 
-ensure_passwall_key() {
-  [ -d /etc/opkg/keys ] || mkdir -p /etc/opkg/keys
+say "Detected release tag: ${REL_TAG}"
+say "Detected opkg arch:   ${OPKG_ARCH}"
 
-  if command -v wget >/dev/null 2>&1; then
-    wget -qO /tmp/passwall.pub "$PW_KEY_URL" || die "Failed to download Passwall public key"
-  elif command -v uclient-fetch >/dev/null 2>&1; then
-    uclient-fetch -q -O /tmp/passwall.pub "$PW_KEY_URL" || die "Failed to download Passwall public key"
-  elif command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$PW_KEY_URL" -o /tmp/passwall.pub || die "Failed to download Passwall public key"
-  else
-    die "No downloader found (need wget-ssl or curl or uclient-fetch)"
-  fi
+if [ "$OPKG_ARCH" = "unknown" ] || [ -z "$OPKG_ARCH" ]; then
+  say "ERROR: Could not detect opkg architecture."
+  exit 1
+fi
 
-  fp="$(opkg-key add /tmp/passwall.pub 2>/dev/null || true)"
-  rm -f /tmp/passwall.pub
-  [ -n "$fp" ] || true
-}
+# --- Ensure base tools ---
+if ! need_cmd wget && ! need_cmd curl; then
+  say "Installing wget-ssl ..."
+  opkg update >/dev/null 2>&1 || true
+  opkg install wget-ssl >/dev/null 2>&1 || true
+fi
 
-rewrite_passwall_feeds() {
-  rel_tag="$1"
-  arch="$2"
+# --- Rebuild passwall feeds to match detected arch ---
+say "=== Rewriting Passwall feeds (prevents wrong-arch downloads) ==="
+PASSWALL_LIST="/etc/opkg/customfeeds.conf"
+mkdir -p /etc/opkg
 
-  [ -d /etc/opkg ] || mkdir -p /etc/opkg
-  conf="/etc/opkg/customfeeds.conf"
-  [ -f "$conf" ] || : > "$conf"
-
-  # Remove any previous passwall-build entries to avoid arch mismatches
-  tmp="/tmp/customfeeds.conf.$$"
-  awk '
-    BEGIN{IGNORECASE=1}
-    $0 ~ /openwrt-passwall-build/ {next}
-    $1=="src/gz" && ($2 ~ /^passwall2$/ || $2 ~ /^passwall_packages$/) {next}
-    {print}
-  ' "$conf" > "$tmp" || true
-  mv "$tmp" "$conf"
-
-  cat >> "$conf" <<EOM
-
-src/gz passwall2 ${PASSWALL_BASE}/packages-${rel_tag}/${arch}/passwall2
-src/gz passwall_packages ${PASSWALL_BASE}/packages-${rel_tag}/${arch}/passwall_packages
-EOM
-}
-
-opkg_update_safe() {
-  opkg update || die "opkg update failed"
-}
-
-ensure_pkg() {
-  pkg="$1"
-  if opkg status "$pkg" >/dev/null 2>&1; then
-    log "OK: $pkg already installed"
-    return 0
-  fi
-  log "Installing: $pkg"
-  opkg install "$pkg" || die "Failed to install: $pkg"
-}
-
-ensure_dnsmasq_full() {
-  if opkg status dnsmasq-full >/dev/null 2>&1; then
-    log "OK: dnsmasq-full already installed"
-    return 0
-  fi
-  if opkg status dnsmasq >/dev/null 2>&1; then
-    log "Switching dnsmasq -> dnsmasq-full"
-    opkg remove dnsmasq || true
-  fi
-  ensure_pkg dnsmasq-full
-}
-
-ensure_passwall2_iran_shunt() {
-  # Ensure base config exists
-  if [ ! -f /etc/config/passwall2 ]; then
-    /etc/init.d/passwall2 stop >/dev/null 2>&1 || true
-    /etc/init.d/passwall2 start >/dev/null 2>&1 || true
-  fi
-
-  # Create/overwrite IRAN shunt rule section
-  uci -q delete passwall2.IRAN || true
-  uci set passwall2.IRAN='shunt_rules'
-  uci set passwall2.IRAN.remarks='IRAN'
-  uci set passwall2.IRAN.network='tcp,udp'
-
-  # Domain list (tested safer baseline for Iran shunt)
-  # - geosite:category-ir is the primary maintained bucket
-  # - ext:iran.dat:ir and ext:iran.dat:other rely on /usr/share/v2ray/iran.dat if present
-  uci set passwall2.IRAN.domain_list="geosite:category-ir
-ext:iran.dat:ir
-ext:iran.dat:other"
-
-  # IP list
-  uci set passwall2.IRAN.ip_list="geoip:ir
-geoip:private"
-
-  # Make Passwall2 use IRAN list as "china" selector (Passwall2 naming quirk)
-  uci set passwall2.@global[0].china='IRAN'
-
-  uci commit passwall2
-}
-
-main() {
-  need_cmd opkg
-  need_cmd uci
-
-  rel_tag="$(detect_release_tag)"
-  arch="$(detect_best_arch)"
-
-  log "=== [$SCRIPT_NAME] Starting ==="
-  log "Detected release tag: $rel_tag"
-  log "Detected opkg arch:   $arch"
-
-  log "=== Rewriting Passwall feeds (prevents wrong-arch downloads) ==="
-  rewrite_passwall_feeds "$rel_tag" "$arch"
-
-  log "=== Ensuring Passwall GPG key ==="
-  ensure_passwall_key
-
-  log "=== opkg update ==="
-  opkg_update_safe
-
-  log "=== Core deps ==="
-  ensure_dnsmasq_full
-  ensure_pkg kmod-nft-socket
-  ensure_pkg kmod-nft-tproxy
-
-  log "=== Passwall2 + required deps ==="
-  # luci-app-passwall2 requires tcping and geoview on your build
-  ensure_pkg tcping
-  ensure_pkg geoview
-  ensure_pkg xray-core
-  ensure_pkg luci-app-passwall2
-
-  log "=== Iran shunt rules (domain/ip) ==="
-  ensure_passwall2_iran_shunt
-
-  log "=== Enable service (do not force start) ==="
-  /etc/init.d/passwall2 enable >/dev/null 2>&1 || true
-
-  log "=== Verification ==="
-  opkg status luci-app-passwall2 >/dev/null 2>&1 && log "OK: luci-app-passwall2 installed"
-  opkg status xray-core >/dev/null 2>&1 && log "OK: xray-core installed"
-  opkg status geoview >/dev/null 2>&1 && log "OK: geoview installed"
-  opkg status tcping >/dev/null 2>&1 && log "OK: tcping installed"
-  uci -q get passwall2.@global[0].china | grep -q '^IRAN$' && log "OK: passwall2 global china=IRAN"
-  uci -q show passwall2.IRAN >/dev/null 2>&1 && log "OK: passwall2.IRAN shunt section exists"
-
-  log "=== Done ==="
-  log "Next: Configure your nodes in LuCI -> Services -> Passwall2, then enable Passwall2 global switch."
-}
-
-main "$@"
+cat > "$PASSWALL_LIST" <<EOF
+src/gz passwall2 https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-${REL_TAG}/${OPKG_ARCH}/passwall2
+src/gz passwall_packages https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-${REL_TAG}/${OPKG_ARCH}/passwall_packages
 EOF
-chmod +x /tmp/install_passwall2_iran.sh
-sh /tmp/install_passwall2_iran.sh
+
+# --- Passwall repo key (idempotent) ---
+say "=== Ensuring Passwall GPG key ==="
+KEY_DST="/etc/opkg/keys/02a4f3a0b1c0d7e9"  # name doesn't matter; content does
+if [ ! -s "$KEY_DST" ]; then
+  # Key published by passwall-build; using the canonical URL is important
+  # If key already exists under another name, opkg will still work.
+  TMPKEY="/tmp/passwall.key"
+  if need_cmd wget; then
+    wget -qO "$TMPKEY" "https://master.dl.sourceforge.net/project/openwrt-passwall-build/passwall.pub" || true
+  else
+    curl -fsSL -o "$TMPKEY" "https://master.dl.sourceforge.net/project/openwrt-passwall-build/passwall.pub" || true
+  fi
+  if [ -s "$TMPKEY" ]; then
+    cp "$TMPKEY" "$KEY_DST" 2>/dev/null || true
+    rm -f "$TMPKEY" || true
+  fi
+fi
+
+# --- Update feeds ---
+say "=== opkg update ==="
+opkg update
+
+# --- Core deps that are safe/needed for Passwall2 on fw4/nft ---
+say "=== Core deps ==="
+opkg install dnsmasq-full >/dev/null 2>&1 || true
+opkg install kmod-nft-socket kmod-nft-tproxy >/dev/null 2>&1 || true
+
+# --- Install Passwall2 + minimal dependencies (NO full system upgrade) ---
+say "=== Passwall2 + required deps ==="
+# These are required by luci-app-passwall2 in many builds
+opkg install tcping geoview >/dev/null 2>&1 || true
+
+# Main packages
+opkg install luci-app-passwall2 xray-core >/dev/null 2>&1 || {
+  say "ERROR: Failed to install luci-app-passwall2 and/or xray-core."
+  exit 1
+}
+
+# Geo data packages (best effort; different feeds name them differently)
+opkg install v2ray-geoip v2ray-geosite >/dev/null 2>&1 || true
+opkg install xray-geoip xray-geosite >/dev/null 2>&1 || true
+
+# --- Ensure iran.dat exists for ext:iran.dat:* usage ---
+say "=== Ensuring /usr/share/v2ray/iran.dat ==="
+mkdir -p /usr/share/v2ray
+if [ ! -s /usr/share/v2ray/iran.dat ]; then
+  # Use your existing known-good file source if you prefer.
+  # This URL should point to a raw iran.dat you trust.
+  IRAN_URL="https://raw.githubusercontent.com/bootmortis/iran-hosted-domains/main/iran.dat"
+  if need_cmd wget; then
+    wget -qO /usr/share/v2ray/iran.dat "$IRAN_URL" || true
+  else
+    curl -fsSL -o /usr/share/v2ray/iran.dat "$IRAN_URL" || true
+  fi
+fi
+if [ ! -s /usr/share/v2ray/iran.dat ]; then
+  say "WARNING: iran.dat not present; ext:iran.dat:* will not work until you provide it."
+fi
+
+# --- Build Passwall2 config sections if missing ---
+say "=== Creating Passwall2 base sections if missing ==="
+uci -q show passwall2 >/dev/null 2>&1 || touch /etc/config/passwall2
+
+# Ensure @global[0]
+if ! uci -q get passwall2.@global[0] >/dev/null 2>&1; then
+  uci add passwall2 global >/dev/null
+fi
+
+# Ensure @global_forwarding[0] (not always present on fresh installs)
+if ! uci -q get passwall2.@global_forwarding[0] >/dev/null 2>&1; then
+  uci add passwall2 global_forwarding >/dev/null
+fi
+
+# Set "china" to Iran (Passwall naming quirk; keeps compatibility with UI)
+uci set passwall2.@global[0].china='Iran' 2>/dev/null || true
+
+# --- Create/overwrite IRAN shunt rule deterministically ---
+say "=== Installing Iran shunt rules (domain/ip) ==="
+
+# Find existing named section "IRAN" of type shunt_rules, else create it
+IRAN_SEC=""
+# if exists, uci get works:
+if uci -q get passwall2.IRAN >/dev/null 2>&1; then
+  IRAN_SEC="IRAN"
+else
+  # create named section
+  uci add passwall2 shunt_rules >/dev/null
+  # last added section is @shunt_rules[-1], rename to IRAN
+  LAST="$(uci show passwall2 | awk -F= '/=shunt_rules/{sec=$1} END{print sec}')"
+  [ -n "$LAST" ] || { say "ERROR: could not create shunt_rules section"; exit 1; }
+  uci rename "${LAST}=IRAN"
+  IRAN_SEC="IRAN"
+fi
+
+# Apply the known-good combo you confirmed works:
+# Domain:
+#   geosite:category-ir
+#   ext:iran.dat:ir
+#   ext:iran.dat:other
+# IP:
+#   geoip:ir
+#   geoip:private
+uci set "passwall2.${IRAN_SEC}.remarks=IRAN"
+uci set "passwall2.${IRAN_SEC}.network=tcp,udp"
+uci set "passwall2.${IRAN_SEC}.domain_list=geosite:category-ir ext:iran.dat:ir ext:iran.dat:other"
+uci set "passwall2.${IRAN_SEC}.ip_list=geoip:ir geoip:private"
+
+# Commit
+uci commit passwall2
+
+# Restart services best-effort
+say "=== Restarting Passwall2 services (best effort) ==="
+[ -x /etc/init.d/passwall2 ] && /etc/init.d/passwall2 restart >/dev/null 2>&1 || true
+[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd restart >/dev/null 2>&1 || true
+
+say "=== DONE: Passwall2 installed + IRAN shunt rule created automatically ==="
+say "Rule written to: passwall2.IRAN (domain_list/ip_list)"

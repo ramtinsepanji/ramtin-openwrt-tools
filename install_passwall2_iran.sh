@@ -1,161 +1,211 @@
 #!/bin/sh
 set -eu
 
-log() { echo "=== [install_passwall2_iran] $*"; }
-die() { echo "ERROR: $*" >&2; exit 1; }
+TAG="install_passwall2_iran"
 
-# --------- Detect OpenWrt release tag (major.minor) ----------
-REL_TAG="$(. /etc/openwrt_release 2>/dev/null; echo "${DISTRIB_RELEASE:-}")"
-[ -n "${REL_TAG:-}" ] || REL_TAG="$(cat /etc/openwrt_version 2>/dev/null | head -n1 || true)"
-REL_TAG="$(echo "${REL_TAG:-}" | awk -F. 'NF>=2{print $1"."$2}')"
-[ -n "${REL_TAG:-}" ] || REL_TAG="24.10"
+log(){ echo "=== [$TAG] $*"; }
+warn(){ echo ">>> [$TAG] WARNING: $*" >&2; }
+die(){ echo ">>> [$TAG] ERROR: $*" >&2; exit 1; }
 
-# --------- Detect correct arch for Passwall feed ----------
-detect_arch_from_opkg() {
-  # Pick highest-priority arch excluding all/noarch
-  opkg print-architecture 2>/dev/null \
-  | awk '$2!="all" && $2!="noarch"{print $2, $3}' \
-  | sort -k2,2nr 2>/dev/null \
-  | head -n1 \
-  | awk '{print $1}'
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+rel_tag() {
+  if [ -f /etc/openwrt_release ]; then
+    . /etc/openwrt_release 2>/dev/null || true
+    echo "${DISTRIB_RELEASE:-24.10.0}" | awk -F. '{print $1"."$2}'
+  else
+    echo "24.10"
+  fi
 }
 
-detect_arch_from_distfeeds() {
-  # Extract arch from official feed URLs: .../packages/<ARCH>/base
-  for f in /etc/opkg/distfeeds.conf /etc/opkg/customfeeds.conf; do
-    [ -f "$f" ] || continue
-    awk '
-      match($0, /\/packages\/([^\/]+)\/(base|luci|packages|routing|telephony)\//, a) {
-        print a[1]; exit
+opkg_primary_arch() {
+  opkg print-architecture 2>/dev/null | awk '
+    $2!="all" && $2!="noarch" {print $2; exit}
+  '
+}
+
+pkg_installed() {
+  opkg status "$1" 2>/dev/null | grep -q '^Status: .* installed'
+}
+
+pkg_upgradable() {
+  opkg list-upgradable 2>/dev/null | awk '{print $1}' | grep -qx "$1"
+}
+
+ensure_pkg() {
+  PKG="$1"
+  OPTIONAL="${2:-0}"
+
+  if pkg_installed "$PKG"; then
+    if pkg_upgradable "$PKG"; then
+      log "Upgrading: $PKG"
+      opkg upgrade "$PKG" >/dev/null 2>&1 || {
+        [ "$OPTIONAL" = "1" ] && warn "Upgrade failed for optional $PKG (skip)" && return 0
+        die "Upgrade failed for required $PKG"
       }
-    ' "$f" 2>/dev/null && return 0
-  done
-  return 1
+    else
+      log "OK: $PKG already installed"
+    fi
+  else
+    log "Installing: $PKG"
+    opkg install "$PKG" >/dev/null 2>&1 || {
+      [ "$OPTIONAL" = "1" ] && warn "Install failed for optional $PKG (skip)" && return 0
+      die "Install failed for required $PKG"
+    }
+  fi
 }
 
-OPKG_ARCH="$(detect_arch_from_opkg || true)"
-if [ -z "${OPKG_ARCH:-}" ]; then
-  OPKG_ARCH="$(detect_arch_from_distfeeds || true)"
-fi
-# last resort (not great, but better than empty)
-[ -n "${OPKG_ARCH:-}" ] || OPKG_ARCH="$(uname -m)"
+rewrite_passwall_feeds() {
+  REL="$(rel_tag)"
+  ARCH="$(opkg_primary_arch)"
+  [ -n "$ARCH" ] || die "Cannot detect opkg arch (only all/noarch?)"
 
-log "Detected release tag: $REL_TAG"
-log "Detected opkg arch:   $OPKG_ARCH"
+  log "Detected release tag: $REL"
+  log "Detected opkg arch:   $ARCH"
 
-# Hard guard: never allow all/noarch
-case "$OPKG_ARCH" in
-  all|noarch) die "Arch detection returned '$OPKG_ARCH' (invalid for Passwall feed). Run: opkg print-architecture" ;;
-esac
+  FEED="/etc/opkg/customfeeds.conf"
+  BASE="https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-${REL}/${ARCH}"
 
-# --------- Ensure basic commands ----------
-command -v opkg >/dev/null 2>&1 || die "opkg not found."
-command -v wget >/dev/null 2>&1 || die "wget not found."
-command -v uci  >/dev/null 2>&1 || die "uci not found."
+  log "Writing Passwall feeds (arch-correct) => $FEED"
+  cat > "$FEED" <<EOF
+src/gz passwall2 ${BASE}/passwall2
+src/gz passwall_packages ${BASE}/passwall_packages
+EOF
+}
 
-# --------- Rewrite Passwall feeds (ARCH-CORRECT) ----------
-PASSWALL_BASE="https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-${REL_TAG}/${OPKG_ARCH}"
-PASSWALL_FEED1="src/gz passwall2 ${PASSWALL_BASE}/passwall2"
-PASSWALL_FEED2="src/gz passwall_packages ${PASSWALL_BASE}/passwall_packages"
+backup_configs() {
+  TS="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo now)"
+  BK="/root/passwall2-backup-${TS}"
+  mkdir -p "$BK" >/dev/null 2>&1 || true
 
-log "Rewriting Passwall feeds (arch-correct)"
-mkdir -p /etc/opkg
-touch /etc/opkg/customfeeds.conf
-sed -i \
-  '/^[[:space:]]*src\/gz[[:space:]]\+passwall2[[:space:]]/d;
-   /^[[:space:]]*src\/gz[[:space:]]\+passwall_packages[[:space:]]/d' \
-  /etc/opkg/customfeeds.conf 2>/dev/null || true
-{
-  echo "$PASSWALL_FEED1"
-  echo "$PASSWALL_FEED2"
-} >> /etc/opkg/customfeeds.conf
+  [ -f /etc/config/passwall2 ] && cp -f /etc/config/passwall2 "$BK/" || true
+  [ -f /etc/config/passwall2_server ] && cp -f /etc/config/passwall2_server "$BK/" || true
+  [ -f /etc/config/dhcp ] && cp -f /etc/config/dhcp "$BK/" || true
 
-# --------- opkg update (do NOT fail the whole run if one feed transiently fails) ----------
-log "opkg update"
-opkg update || true
+  log "Backup (if existed): $BK"
+}
 
-# Verify passwall lists actually downloaded (otherwise stop with a clear error)
-if ! ls /var/opkg-lists/passwall2 >/dev/null 2>&1; then
-  die "Passwall2 feed list not present. Likely wrong arch or blocked SourceForge. Arch=$OPKG_ARCH"
-fi
+dnsmasq_full_mandatory() {
+  # This function forces dnsmasq-full safely:
+  # - If dnsmasq-full already installed: upgrade if needed
+  # - Else if dnsmasq installed: remove dnsmasq then install dnsmasq-full
+  # - If anything fails: try to rollback to dnsmasq to avoid breaking LAN DNS
+  log "Ensuring dnsmasq-full (mandatory)"
 
-# --------- Helpers ----------
-is_installed() { opkg status "$1" 2>/dev/null | grep -q '^Status: .* installed'; }
-must_install() {
-  PKG="$1"
-  if is_installed "$PKG"; then
-    log "OK: $PKG already installed"
+  if pkg_installed dnsmasq-full; then
+    if pkg_upgradable dnsmasq-full; then
+      log "Upgrading: dnsmasq-full"
+      opkg upgrade dnsmasq-full >/dev/null 2>&1 || die "Upgrade failed: dnsmasq-full"
+    else
+      log "OK: dnsmasq-full already installed"
+    fi
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
     return 0
   fi
-  log "Installing: $PKG"
-  opkg install "$PKG" >/dev/null || die "Cannot install required package: $PKG"
-}
 
-optional_install() {
-  PKG="$1"
-  if is_installed "$PKG"; then
-    log "OK: $PKG already installed"
+  # dnsmasq-full not installed
+  if pkg_installed dnsmasq; then
+    log "dnsmasq is installed; switching to dnsmasq-full (remove dnsmasq -> install dnsmasq-full)"
+
+    # Stop first to reduce chance of transient issues
+    /etc/init.d/dnsmasq stop >/dev/null 2>&1 || true
+
+    # Remove dnsmasq (keep configs under /etc/config/dhcp)
+    opkg remove dnsmasq >/dev/null 2>&1 || {
+      /etc/init.d/dnsmasq start >/dev/null 2>&1 || true
+      die "Cannot remove dnsmasq (required to install dnsmasq-full without file clashes)"
+    }
+
+    # Now install dnsmasq-full
+    if ! opkg install dnsmasq-full >/dev/null 2>&1; then
+      warn "Failed to install dnsmasq-full; attempting rollback to dnsmasq"
+      opkg install dnsmasq >/dev/null 2>&1 || true
+      /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+      die "dnsmasq-full install failed (rollback attempted)"
+    fi
+
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || die "dnsmasq service restart failed after dnsmasq-full install"
+    log "Switched OK: dnsmasq-full is now installed"
     return 0
   fi
-  log "Installing (optional): $PKG"
-  opkg install "$PKG" >/dev/null || log "WARNING: optional package failed: $PKG (skipped)"
+
+  # Neither dnsmasq nor dnsmasq-full installed (rare, but handle)
+  log "Neither dnsmasq nor dnsmasq-full found; installing dnsmasq-full"
+  opkg install dnsmasq-full >/dev/null 2>&1 || die "Cannot install dnsmasq-full"
+  /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
 }
 
-# --------- Core deps (minimal) ----------
-log "Core deps"
-must_install wget-ssl
-must_install curl
-must_install dnsmasq-full
-optional_install kmod-nft-socket
-optional_install kmod-nft-tproxy
+uci_ensure_anon_section() {
+  CONF="$1"; TYPE="$2"
+  if ! uci -q show "$CONF" 2>/dev/null | grep -q "^${CONF}\.@${TYPE}\[0\]="; then
+    uci add "$CONF" "$TYPE" >/dev/null 2>&1 || true
+  fi
+}
 
-# --------- Passwall2 + required deps ----------
-log "Passwall2 + required deps"
-must_install tcping
-must_install geoview
-must_install xray-core
-must_install luci-app-passwall2
+apply_iran_shunt() {
+  have uci || die "uci not found"
 
-# --------- Passwall2 defaults + Iran shunt (create section from scratch) ----------
-log "Configuring Passwall2 + IRAN shunt"
-[ -f /etc/config/passwall2 ] || touch /etc/config/passwall2
+  if ! uci -q show passwall2 >/dev/null 2>&1; then
+    touch /etc/config/passwall2
+  fi
 
-# ensure global exists
-uci -q get passwall2.@global[0] >/dev/null 2>&1 || uci add passwall2 global >/dev/null
+  uci_ensure_anon_section passwall2 global
 
-# user preference: 8.8.8.8 remote dns
-uci -q set passwall2.@global[0].remote_dns_protocol='tcp' || true
-uci -q set passwall2.@global[0].remote_dns='8.8.8.8' || true
-uci -q set passwall2.@global[0].remote_dns_query_strategy='UseIPv4' || true
-uci -q set passwall2.@global[0].china='IRAN' || true
+  uci -q set passwall2.IRAN='shunt_rules'
+  uci -q set passwall2.IRAN.remarks='IRAN'
+  uci -q set passwall2.IRAN.network='tcp,udp'
 
-# disable ipv6 tproxy if section exists
-uci -q set passwall2.@global_forwarding[0].ipv6_tproxy='0' || true
-
-# Rebuild IRAN section every time (prevents "Entry not found" and old garbage)
-uci -q delete passwall2.IRAN
-
-uci set passwall2.IRAN='shunt_rules'
-uci set passwall2.IRAN.remarks='IRAN'
-uci set passwall2.IRAN.network='tcp,udp'
-
-# This is the combo you said works reliably
-uci set passwall2.IRAN.domain_list='geosite:category-ir
+  # Known-good combo from your tests
+  uci -q set passwall2.IRAN.domain_list='geosite:category-ir
 ext:iran.dat:ir
 ext:iran.dat:other'
-
-uci set passwall2.IRAN.ip_list='geoip:ir
+  uci -q set passwall2.IRAN.ip_list='geoip:ir
 geoip:private'
 
-uci commit passwall2
+  uci -q set passwall2.@global[0].china='IRAN'
 
-# enable/restart service
-[ -x /etc/init.d/passwall2 ] && /etc/init.d/passwall2 enable >/dev/null 2>&1 || true
-[ -x /etc/init.d/passwall2 ] && /etc/init.d/passwall2 restart >/dev/null 2>&1 || true
+  uci commit passwall2 >/dev/null 2>&1 || die "uci commit passwall2 failed"
+  [ -x /etc/init.d/passwall2 ] && /etc/init.d/passwall2 restart >/dev/null 2>&1 || true
 
-log "DONE."
-log "Sanity checks:"
-echo "  opkg print-architecture"
-echo "  uci show passwall2.IRAN"
-echo "  ls -l /var/opkg-lists | grep passwall"
-exit 0
+  log "IRAN shunt applied (copy-check):"
+  echo "---- Domain ----"
+  echo "geosite:category-ir"
+  echo "ext:iran.dat:ir"
+  echo "ext:iran.dat:other"
+  echo "---- IP ----"
+  echo "geoip:ir"
+  echo "geoip:private"
+}
+
+main() {
+  have opkg || die "opkg not found"
+
+  log "Start"
+  backup_configs
+  rewrite_passwall_feeds
+
+  log "opkg update"
+  opkg update || die "opkg update failed (check Internet/DNS)"
+
+  # Mandatory: dnsmasq-full (smart swap)
+  dnsmasq_full_mandatory
+
+  # Passwall2 stack (minimal, stable)
+  ensure_pkg wget-ssl 1
+  ensure_pkg curl 1
+
+  ensure_pkg luci-app-passwall2 0
+  ensure_pkg xray-core 0
+  ensure_pkg tcping 0
+  ensure_pkg geoview 0
+
+  # Optional geo packages (many builds already ship dat files)
+  ensure_pkg v2ray-geoip 1
+  ensure_pkg v2ray-geosite 1
+
+  apply_iran_shunt
+
+  log "Done"
+}
+
+main "$@"

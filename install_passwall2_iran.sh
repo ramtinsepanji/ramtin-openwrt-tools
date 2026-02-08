@@ -149,55 +149,72 @@ ensure_passwall2_stack() {
 }
 
 ensure_iran_shunt_rule() {
-  # Passwall2 uses "china" label internally; set it to Iran
+  # Set China label to Iran (Passwall internal behavior)
   uci -q set passwall2.@global[0].china='Iran' 2>/dev/null || true
 
-  # Ensure a shunt_rules section exists and is named IRAN
+  # Ensure IRAN shunt_rules section exists
   if uci -q show passwall2.IRAN >/dev/null 2>&1; then
     IRAN_SEC="IRAN"
   else
-    # Try to find an existing shunt_rules with remarks=IRAN
-    SEC="$(uci show passwall2 2>/dev/null | awk -F'[.=]' '
-      $0 ~ /=shunt_rules$/ {s=$2}
-      $0 ~ "remarks=.IRAN." {print s; exit}
-    ')"
-    if [ -n "${SEC:-}" ]; then
-      IRAN_SEC="$SEC"
-      uci -q rename "passwall2.$IRAN_SEC=IRAN" 2>/dev/null || true
-      IRAN_SEC="IRAN"
-    else
-      # Create one
-      NEW="$(uci add passwall2 shunt_rules 2>/dev/null || true)"
-      [ -n "${NEW:-}" ] || die "Failed to add shunt_rules section"
-      uci -q rename "passwall2.$NEW=IRAN" || die "Failed to rename shunt_rules to IRAN"
-      IRAN_SEC="IRAN"
-    fi
+    NEW="$(uci add passwall2 shunt_rules 2>/dev/null || true)"
+    [ -n "$NEW" ] || die "Failed to create shunt_rules"
+    uci -q rename "passwall2.$NEW=IRAN" || die "Failed to rename shunt_rules"
+    IRAN_SEC="IRAN"
   fi
 
-  # Set rule (newline-based lists, so LuCI shows them زیر هم)
   uci -q batch <<'UCI'
 set passwall2.IRAN.remarks='IRAN'
 set passwall2.IRAN.network='tcp,udp'
 UCI
 
+  # Domain rules (FULL REPLACE)
   uci -q set passwall2.IRAN.domain_list="$(printf '%s\n' \
+'regexp:^.+\.ir$' \
 'geosite:category-ir' \
-'ext:iran.dat:ir' \
-'ext:iran.dat:other')"
+'kifpool.me' \
+'geosite:category-bank-ir' \
+'geosite:category-finance' \
+'geosite:category-media-ir' \
+'geosite:category-news-ir' \
+'geosite:category-tech-ir' \
+'geosite:tld-!cn')"
 
+  # IP rules (FULL REPLACE)
   uci -q set passwall2.IRAN.ip_list="$(printf '%s\n' \
 'geoip:ir' \
-'geoip:private')"
+'0.0.0.0/8' \
+'10.0.0.0/8' \
+'100.64.0.0/10' \
+'127.0.0.0/8' \
+'169.254.0.0/16' \
+'172.16.0.0/12' \
+'192.0.0.0/24' \
+'192.0.2.0/24' \
+'192.88.99.0/24' \
+'192.168.0.0/16' \
+'198.19.0.0/16' \
+'198.51.100.0/24' \
+'203.0.113.0/24' \
+'224.0.0.0/4' \
+'240.0.0.0/4' \
+'255.255.255.255/32' \
+'::/128' \
+'::1/128' \
+'::ffff:0:0:0/96' \
+'64:ff9b::/96' \
+'100::/64' \
+'2001::/32' \
+'2001:20::/28' \
+'2001:db8::/32' \
+'2002::/16' \
+'fc00::/7' \
+'fe80::/10' \
+'ff00::/8')"
 
   uci -q commit passwall2
-
-  # Warn (non-fatal) if iran.dat missing
-  if [ ! -s /usr/share/v2ray/iran.dat ]; then
-    log "NOTE: /usr/share/v2ray/iran.dat not found. ext:iran.dat:* rules need this file."
-  fi
-
   /etc/init.d/passwall2 restart >/dev/null 2>&1 || true
-  log "OK: IRAN shunt rule applied"
+
+  log "OK: IRAN shunt rule replaced with custom domain/IP lists"
 }
 
 patch_default_config_optional() {
@@ -214,21 +231,26 @@ patch_default_config_optional() {
 
   backup_if_exists "$F"
 
-  # Replace China -> Iran, geoip:cn -> geoip:ir, and geosite:cn -> our multiline
+  # Replace China -> Iran, geoip:cn -> geoip:ir
   sed -i \
     -e 's/\bChina\b/Iran/g' \
     -e 's/geoip:cn/geoip:ir/g' \
     "$F" 2>/dev/null || true
 
   # Replace geosite:cn line wherever it appears
-  # BusyBox sed supports \n in replacement in many builds; safer: do a small awk rewrite.
   TMP="/tmp/pw2_default_config.$$"
   awk '
     {
       if ($0 ~ /geosite:cn/) {
+        print "regexp:^.+\\.ir$"
         print "geosite:category-ir"
-        print "ext:iran.dat:ir"
-        print "ext:iran.dat:other"
+        print "kifpool.me"
+        print "geosite:category-bank-ir"
+        print "geosite:category-finance"
+        print "geosite:category-media-ir"
+        print "geosite:category-news-ir"
+        print "geosite:category-tech-ir"
+        print "geosite:tld-!cn"
         next
       }
       print
